@@ -104,6 +104,52 @@ class WorkerThreadTests(unittest.TestCase):
         )
         self.assertNotIn("sbt", backends)
 
+    def test_backend_specific_cases_only_run_on_spike_and_sbt(self):
+        cases = load_module("cases")
+        runner = load_module("runner")
+        backend_specific_indices = {
+            cases.TEST_CASE_INDEX_BY_NAME["cfd_i1"],
+            cases.TEST_CASE_INDEX_BY_NAME["dwt2d_192"],
+        }
+        selected_indices = list(range(len(cases.TEST_CASES)))
+        configs = [
+            runner.BackendRunConfig("spike", "spike", set(), 1),
+            runner.BackendRunConfig("sbt", "sbt", set(), 1),
+            runner.BackendRunConfig("cyclesim", "cyclesim", set(), 1),
+        ]
+
+        jobs = runner._build_test_jobs(
+            runner._attach_backend_selected_indices(configs, selected_indices),
+            selected_indices,
+            timeout_scale=1,
+        )
+
+        backends_by_case = {
+            index: [
+                job.backend.env_backend
+                for job in jobs
+                if job.testcase_index == index
+            ]
+            for index in backend_specific_indices
+        }
+        for enabled_backends in backends_by_case.values():
+            self.assertCountEqual(enabled_backends, ["spike", "sbt"])
+
+    def test_backend_specific_all_checklist_includes_cases_for_spike_and_sbt_only(self):
+        cases = load_module("cases")
+        options = load_module("options")
+        backend_specific_indices = [
+            cases.TEST_CASE_INDEX_BY_NAME["cfd_i1"],
+            cases.TEST_CASE_INDEX_BY_NAME["dwt2d_192"],
+        ]
+
+        matrix = dict(options.parse_matrix("spike:all,sbtsim:all,cycle:all"))
+
+        for index in backend_specific_indices:
+            self.assertIn(index, matrix["spike"])
+            self.assertIn(index, matrix["sbtsim"])
+            self.assertNotIn(index, matrix["cycle"])
+
     def test_cli_passes_progress_mode_to_runner(self):
         cli = load_module("cli")
         cases = load_module("cases")
@@ -122,6 +168,19 @@ class WorkerThreadTests(unittest.TestCase):
             cli.run_all_modes(args, matrix, True, jobs=1, timeout_scale=1, shared_state={})
 
         self.assertEqual(captured["progress_mode"], "ci")
+
+    def test_allow_checklist_failure_only_changes_completed_run_exit_code(self):
+        cli = load_module("cli")
+
+        self.assertEqual(cli.effective_exit_code(1, allow_checklist_failure=True), 0)
+        self.assertEqual(cli.effective_exit_code(0, allow_checklist_failure=True), 0)
+        self.assertEqual(cli.effective_exit_code(1, allow_checklist_failure=False), 1)
+
+    def test_allow_checklist_failure_parser_default_is_strict(self):
+        cli = load_module("cli")
+        args = cli.build_parser().parse_args([])
+
+        self.assertFalse(args.allow_checklist_failure)
 
     def test_ci_progress_tick_prints_heartbeat_after_five_minutes(self):
         progress = load_module("progress")
@@ -146,6 +205,39 @@ class WorkerThreadTests(unittest.TestCase):
         heartbeat = output.getvalue()
         self.assertIn("[heartbeat] completed=0/1", heartbeat)
         self.assertIn("rtlsim-no-cache:pass=0,fail=0,flaky=0,running=1", heartbeat)
+
+    def test_tqdm_backend_names_are_short_display_labels(self):
+        progress = load_module("progress")
+
+        self.assertEqual(progress._format_tqdm_backend_name("rtlsim-with-cache"), "rtl-cache")
+        self.assertEqual(progress._format_tqdm_backend_name("rtlsim-no-cache"), "rtl-nocache")
+        self.assertEqual(progress._format_tqdm_backend_name("rtlsim-with-cache-gvm"), "rtl-cache-gvm")
+        self.assertEqual(progress._format_tqdm_backend_name("rtlsim-no-cache-gvm"), "rtl-nocache-gvm")
+        self.assertEqual(progress._format_tqdm_backend_name("spike"), "spike")
+
+    def test_tqdm_bars_use_compact_format(self):
+        progress = load_module("progress")
+        config = Namespace(name="rtlsim-with-cache", repeat=10)
+
+        with mock.patch.object(progress, "tqdm", return_value=object()) as fake_tqdm:
+            progress._create_progress_bars([config], total_reps=10, selected_count=1)
+
+        kwargs = fake_tqdm.call_args.kwargs
+        self.assertEqual(kwargs["desc"], "rtl-cache")
+        self.assertEqual(kwargs["bar_format"], progress.TQDM_BAR_FORMAT)
+        self.assertTrue(kwargs["dynamic_ncols"])
+
+    def test_tqdm_postfix_rolls_flaky_into_fail(self):
+        progress = load_module("progress")
+
+        postfix = progress._format_tqdm_status_postfix(
+            pass_count=5,
+            fail_count=1,
+            flaky_count=2,
+            running_count=3,
+        )
+
+        self.assertEqual(postfix, "ok=5 fail=3 run=3")
 
     @staticmethod
     def _fake_run_test_job(job):
